@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ECE Item Scanner</title>
+<style>
+  :root{--bg:#0f1214;--panel:#1a1f23;--ink:#eef2f4;--dim:#8b979f;--acc:#3ee08f;--warn:#ffb347}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  main{max-width:560px;margin:0 auto;padding:12px}
+  h1{font-size:18px;margin:4px 0 10px;font-weight:650;letter-spacing:.2px}
+  .stage{position:relative;border-radius:16px;overflow:hidden;background:#000;aspect-ratio:3/4}
+  video,#still{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #still{display:none}
+  .reticle{position:absolute;left:50%;top:50%;width:87.5%;aspect-ratio:1;transform:translate(-50%,-50%);
+           border:2px solid rgba(255,255,255,.55);border-radius:14px;pointer-events:none}
+  .result{position:absolute;left:0;right:0;bottom:0;padding:16px 16px 14px;
+          background:linear-gradient(transparent,rgba(0,0,0,.85) 40%)}
+  #label{font-size:30px;font-weight:750;line-height:1.1}
+  #conf{color:var(--acc);font-weight:600}
+  .unsure #label{color:var(--warn)} .unsure #conf{color:var(--warn)}
+  .bars{margin-top:12px;background:var(--panel);border-radius:14px;padding:12px 14px}
+  .row{display:grid;grid-template-columns:minmax(0,9em) 1fr 3.2em;gap:10px;align-items:center;margin:6px 0;font-size:14px}
+  .row span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track{height:10px;background:#2a3137;border-radius:6px;overflow:hidden}
+  .fill{height:100%;background:var(--acc);border-radius:6px;transition:width .15s}
+  .row b{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  button,label.btn{flex:1 1 auto;min-height:46px;border:0;border-radius:12px;background:var(--panel);color:var(--ink);
+         font:600 15px system-ui,sans-serif;padding:0 14px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+  button:focus-visible,label.btn:focus-within{outline:2px solid var(--acc)}
+  button.primary{background:var(--acc);color:#05230f}
+  .set{margin-top:12px;color:var(--dim);font-size:14px;display:flex;gap:10px;align-items:center}
+  .set input{flex:1;accent-color:var(--acc)}
+  #status{color:var(--dim);font-size:14px;margin-top:10px;min-height:1.4em}
+  input[type=file]{display:none}
+  details{margin-top:14px;background:var(--panel);border-radius:14px;padding:12px 14px}
+  summary{cursor:pointer;font-weight:650;min-height:28px}
+  .teach{display:grid;gap:10px;margin-top:10px}
+  .teach select,.teach input[type=text]{min-height:46px;border-radius:12px;border:1px solid #2a3137;background:#0f1214;color:var(--ink);font:16px system-ui,sans-serif;padding:0 12px}
+  #recBtn{touch-action:none;user-select:none;-webkit-user-select:none}
+  #recBtn.on{background:#ff5a5a;color:#fff}
+  .hint{color:var(--dim);font-size:14px;margin:0}
+</style>
+</head>
+<body>
+<main>
+  <h1>ECE Item Scanner</h1>
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <img id="still" alt="Selected photo">
+    <div class="reticle"></div>
+    <div class="result" id="result">
+      <div id="label">Loading model…</div>
+      <div id="conf">&nbsp;</div>
+    </div>
+  </div>
+
+  <div class="bars" id="bars"></div>
+
+  <div class="controls">
+    <button id="startBtn" class="primary">Start camera</button>
+    <button id="flipBtn">Flip camera</button>
+    <button id="pauseBtn">Pause</button>
+    <label class="btn">Photo<input id="file" type="file" accept="image/*" capture="environment"></label>
+  </div>
+  <div class="set">
+    <span>Confidence needed</span>
+    <input id="thr" type="range" min="30" max="95" value="60">
+    <b id="thrVal">60%</b>
+  </div>
+  <div id="status"></div>
+
+  <details id="teachBox">
+    <summary>Teach mode: add training photos</summary>
+    <div class="teach">
+      <p class="hint">Pick what's in the square, then hold the button and slowly move around the item (angles, distance, lighting). Photos go straight into the dataset folder on your PC. Afterwards run train.bat.</p>
+      <select id="teachLabel"></select>
+      <input id="newLabel" type="text" placeholder="…or type a new item name (e.g. wire_stripper)">
+      <button id="recBtn">Hold to capture</button>
+      <p class="hint" id="teachCount">0 photos sent this session</p>
+    </div>
+  </details>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script>
+{
+  const $ = id => document.getElementById(id);
+  const video = $('video'), still = $('still'), statusEl = $('status');
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  let session, meta, stream, facing = 'environment', running = false, paused = false, busy = false;
+  const history = [];           // recent probability vectors for smoothing
+  const SMOOTH = 5;
+
+  const pretty = s => s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  const setStatus = t => statusEl.textContent = t;
+
+  async function loadModel() {
+    try {
+      meta = await (await fetch('labels.json')).json();
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+      ort.env.wasm.numThreads = 1;
+      session = await ort.InferenceSession.create('model.onnx', { executionProviders: ['wasm'] });
+      canvas.width = canvas.height = meta.img_size;
+      $('label').textContent = 'Ready';
+      $('conf').textContent = `${meta.classes.length} classes` + (meta.val_acc ? ` · val acc ${(meta.val_acc*100).toFixed(1)}%` : '');
+      renderBars(new Array(meta.classes.length).fill(0));
+    } catch (e) {
+      $('label').textContent = 'Model not found';
+      setStatus('Run "python train.py" first, then "python serve.py". ' + e.message);
+    }
+  }
+
+  // Same preprocessing as train.py / predict.py: center crop 87.5% of short side -> 224, ImageNet normalize
+  function toTensor(src, w, h) {
+    const S = meta.img_size, side = Math.min(w, h) * meta.crop;
+    ctx.drawImage(src, (w - side) / 2, (h - side) / 2, side, side, 0, 0, S, S);
+    const px = ctx.getImageData(0, 0, S, S).data, n = S * S;
+    const out = new Float32Array(3 * n), [m0, m1, m2] = meta.mean, [s0, s1, s2] = meta.std;
+    for (let i = 0; i < n; i++) {
+      out[i]         = (px[i*4]   / 255 - m0) / s0;
+      out[i + n]     = (px[i*4+1] / 255 - m1) / s1;
+      out[i + 2 * n] = (px[i*4+2] / 255 - m2) / s2;
+    }
+    return new ort.Tensor('float32', out, [1, 3, S, S]);
+  }
+
+  async function classify(src, w, h) {
+    const res = await session.run({ input: toTensor(src, w, h) });
+    const logits = res.logits.data, mx = Math.max(...logits);
+    const e = Array.from(logits, v => Math.exp(v - mx)), sum = e.reduce((a, b) => a + b, 0);
+    return e.map(v => v / sum);
+  }
+
+  function show(probs) {
+    const thr = $('thr').value / 100;
+    let best = 0;
+    probs.forEach((p, i) => { if (p > probs[best]) best = i; });
+    const name = meta.classes[best], p = probs[best];
+    const unsure = p < thr || name === 'background';
+    $('result').classList.toggle('unsure', unsure);
+    $('label').textContent = name === 'background' && p >= thr ? 'No ECE item' : unsure ? 'Not sure…' : pretty(name);
+    $('conf').textContent = unsure && name !== 'background' ? `best guess: ${pretty(name)} ${(p*100).toFixed(0)}%` : `${(p*100).toFixed(0)}% confident`;
+    renderBars(probs);
+  }
+
+  function renderBars(probs) {
+    const order = probs.map((p, i) => [p, i]).sort((a, b) => b[0] - a[0]).slice(0, 5);
+    $('bars').innerHTML = order.map(([p, i]) =>
+      `<div class="row"><span>${pretty(meta.classes[i])}</span><div class="track"><div class="fill" style="width:${(p*100).toFixed(1)}%"></div></div><b>${(p*100).toFixed(0)}%</b></div>`
+    ).join('');
+  }
+
+  async function loop() {
+    if (!running) return;
+    if (!paused && !busy && video.readyState >= 2 && session) {
+      busy = true;
+      try {
+        const probs = await classify(video, video.videoWidth, video.videoHeight);
+        history.push(probs); if (history.length > SMOOTH) history.shift();
+        const avg = probs.map((_, i) => history.reduce((a, h) => a + h[i], 0) / history.length);
+        show(avg);
+      } catch (e) { setStatus('Inference error: ' + e.message); }
+      busy = false;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  async function startCamera() {
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      setStatus('Live camera is not available in this browser. Tap Photo to snap a picture instead.');
+      return;
+    }
+    try {
+      stream?.getTracks().forEach(t => t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 } }, audio: false });
+      video.srcObject = stream; await video.play();
+      still.style.display = 'none'; video.style.display = 'block';
+      history.length = 0; paused = false; $('pauseBtn').textContent = 'Pause';
+      $('startBtn').textContent = 'Restart camera';
+      setStatus('Point the square at an item.');
+      if (!running) { running = true; loop(); }
+    } catch (e) { setStatus('Camera blocked: ' + e.message); }
+  }
+
+  $('startBtn').onclick = startCamera;
+  $('flipBtn').onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); };
+  $('pauseBtn').onclick = () => {
+    paused = !paused; $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+    if (!paused) { still.style.display = 'none'; video.style.display = 'block'; history.length = 0; }
+  };
+  $('thr').oninput = () => { $('thrVal').textContent = $('thr').value + '%'; if (history.length) show(history.at(-1)); };
+
+  $('file').onchange = async ev => {
+    const f = ev.target.files[0]; if (!f || !session) return;
+    paused = true; $('pauseBtn').textContent = 'Resume';
+    still.src = URL.createObjectURL(f);
+    await still.decode();
+    still.style.display = 'block'; video.style.display = 'none';
+    const probs = await classify(still, still.naturalWidth, still.naturalHeight);
+    history.length = 0; history.push(probs); show(probs);
+    setStatus('Photo classified. Tap Resume or Start camera to go live.');
+    ev.target.value = '';
+  };
+
+  // ---------- Teach mode ----------
+  const snap = document.createElement('canvas');
+  let recTimer = null, sent = 0, inflight = 0;
+  function fillLabels(classes) {
+    $('teachLabel').innerHTML = classes.map(c => `<option value="${c}">${pretty(c)}</option>`).join('');
+  }
+  function teachLabel() {
+    const t = $('newLabel').value.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+    return t || $('teachLabel').value;
+  }
+  function grab() {
+    if (inflight > 3 || video.readyState < 2) return;
+    const w = video.videoWidth, h = video.videoHeight, side = Math.min(w, h) * 0.875, S = 448;
+    snap.width = snap.height = S;
+    snap.getContext('2d').drawImage(video, (w - side) / 2, (h - side) / 2, side, side, 0, 0, S, S);
+    const label = teachLabel();
+    if (!label) { setStatus('Choose or type a label first.'); return; }
+    inflight++;
+    snap.toBlob(async blob => {
+      try {
+        const r = await fetch('upload?label=' + encodeURIComponent(label), { method: 'POST', body: blob });
+        const j = await r.json();
+        sent++;
+        $('teachCount').textContent = `${sent} photos sent this session · ${pretty(j.label)} now has ${j.phone_photos} phone photos`;
+      } catch (e) { setStatus('Upload failed: is serve.py running? ' + e.message); }
+      inflight--;
+    }, 'image/jpeg', 0.9);
+  }
+  function startRec(e) {
+    e.preventDefault();
+    if (!stream) { setStatus('Start the camera first.'); return; }
+    if (recTimer) return;
+    $('recBtn').classList.add('on'); $('recBtn').textContent = 'Capturing… release to stop';
+    grab(); recTimer = setInterval(grab, 300);
+  }
+  function stopRec() {
+    clearInterval(recTimer); recTimer = null;
+    $('recBtn').classList.remove('on'); $('recBtn').textContent = 'Hold to capture';
+  }
+  $('recBtn').addEventListener('pointerdown', startRec);
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => $('recBtn').addEventListener(ev, stopRec));
+
+  // Teach mode only works with serve.py on the PC; hide it on the hosted site
+  const local = /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname);
+  if (!local) $('teachBox').style.display = 'none';
+  loadModel().then(() => meta && fillLabels(meta.classes));
+}
+</script>
+</body>
+</html>
